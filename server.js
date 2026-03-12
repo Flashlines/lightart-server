@@ -3,57 +3,52 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
 
-// Track clients: { ws, id, type }
-const clients = new Map();
+const clients = new Map(); // clientId → { ws, isTD }
 let clientCounter = 0;
 
-function broadcast(data, excludeWs = null) {
-  const msg = JSON.stringify(data);
-  clients.forEach(({ ws }) => {
-    if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
-      ws.send(msg);
-    }
-  });
-}
-
-wss.on("connection", (ws, req) => {
+wss.on("connection", (ws) => {
   const clientId = `client_${++clientCounter}`;
-  const isTD = req.url?.includes("touchdesigner");
-  clients.set(clientId, { ws, id: clientId, isTD });
+  clients.set(clientId, { ws, isTD: false });
 
-  console.log(`[+] ${isTD ? "TouchDesigner" : "Browser"} connected: ${clientId} (total: ${clients.size})`);
+  console.log(`[+] New connection: ${clientId} (total: ${clients.size})`);
 
-  // Send assigned ID to browser client
-  if (!isTD) {
-    ws.send(JSON.stringify({ type: "init", clientId, clientCount: clients.size }));
-    // Notify all about new visitor count
-    broadcast({ type: "clientCount", count: [...clients.values()].filter(c => !c.isTD).length });
-  }
+  // Send init to everyone – TD will identify itself back
+  ws.send(JSON.stringify({ type: "init", clientId, clientCount: clients.size }));
+  broadcastCount();
 
   ws.on("message", (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // Attach sender ID and forward
-    msg.clientId = clientId;
-    msg.timestamp = Date.now();
+    // TD registers itself
+    if (msg.type === "register" && msg.role === "touchdesigner") {
+      const entry = clients.get(clientId);
+      if (entry) entry.isTD = true;
+      console.log(`[TD] TouchDesigner registered: ${clientId}`);
+      ws.send(JSON.stringify({ type: "registered", clientId }));
+      broadcastCount();
+      return;
+    }
 
-    // Forward to TouchDesigner instances
-    clients.forEach(({ ws: targetWs, isTD: targetIsTD }) => {
-      if (targetIsTD && targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(JSON.stringify(msg));
-      }
-    });
-
-    // Echo back to all browsers for collaborative awareness (optional)
-    // broadcast(msg, ws);
+    // Control message from browser → forward to all TDs
+    if (msg.type === "control") {
+      msg.clientId = clientId;
+      msg.timestamp = Date.now();
+      let forwarded = 0;
+      clients.forEach(({ ws: targetWs, isTD }) => {
+        if (isTD && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(JSON.stringify(msg));
+          forwarded++;
+        }
+      });
+      console.log(`[→] Control from ${clientId} forwarded to ${forwarded} TD(s)`);
+    }
   });
 
   ws.on("close", () => {
     clients.delete(clientId);
-    const browserCount = [...clients.values()].filter(c => !c.isTD).length;
     console.log(`[-] Disconnected: ${clientId} (remaining: ${clients.size})`);
-    broadcast({ type: "clientCount", count: browserCount });
+    broadcastCount();
   });
 
   ws.on("error", (err) => {
@@ -61,6 +56,12 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+function broadcastCount() {
+  const browserCount = [...clients.values()].filter(c => !c.isTD).length;
+  const msg = JSON.stringify({ type: "clientCount", count: browserCount });
+  clients.forEach(({ ws }) => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  });
+}
+
 console.log(`✦ WebSocket server running on port ${PORT}`);
-console.log(`  Browser clients → ws://localhost:${PORT}`);
-console.log(`  TouchDesigner   → ws://localhost:${PORT}?touchdesigner`);
