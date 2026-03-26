@@ -321,3 +321,4 @@ server.listen(PORT, () => {
   console.log(`   Renderer: http://localhost:${PORT}/renderer.html?wall=WALL_ID`);
   console.log(`   Mobile:   http://localhost:${PORT}/app.html?wall=WALL_ID\n`);
 });
+
