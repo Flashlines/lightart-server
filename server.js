@@ -29,16 +29,24 @@ wss.on("connection", (ws) => {
         }
       });
 
-      console.log(`[→] control from ${clientId}: hue=${Math.round(msg.hue)}° x=${msg.x?.toFixed(2)} y=${msg.y?.toFixed(2)} spd=${msg.speed?.toFixed(2)}`);
+      console.log(`[→] control from ${clientId}: px=${msg.px?.toFixed(2)} py=${msg.py?.toFixed(2)} size=${msg.size?.toFixed(2)} h=${msg.color_h?.toFixed(2)} s=${msg.color_s?.toFixed(2)} v=${msg.color_v?.toFixed(2)}`);
     }
   });
 
   ws.on("close", () => {
     clients.delete(clientId);
     console.log(`[-] Disconnected: ${clientId} (remaining: ${clients.size})`);
-    // Broadcast updated count
-    const msg = JSON.stringify({ type: "clientCount", count: clients.size });
-    clients.forEach((ws) => { if (ws.readyState === WebSocket.OPEN) ws.send(msg); });
+
+    // Tell everyone (including TouchDesigner) which client left, so it can
+    // be pruned from any per-instance table/CHOP.
+    const leaveMsg = JSON.stringify({ type: "leave", clientId, timestamp: Date.now() });
+    const countMsg = JSON.stringify({ type: "clientCount", count: clients.size });
+    clients.forEach((targetWs) => {
+      if (targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(leaveMsg);
+        targetWs.send(countMsg);
+      }
+    });
   });
 
   ws.on("error", (err) => console.error(`[!] ${clientId}:`, err.message));
