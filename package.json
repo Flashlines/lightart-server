@@ -1,7 +1,7 @@
 {
-  "name": "lichtkunst-ws-server",
+  "name": "interact-flashlines-ws-server",
   "version": "1.0.0",
-  "description": "WebSocket relay server for interactive light art installation",
+  "description": "WebSocket relay server for interact.flashlines.net (TouchDesigner instancing control)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
