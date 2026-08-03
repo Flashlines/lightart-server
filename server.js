@@ -10,6 +10,13 @@ wss.on("connection", (ws) => {
   const clientId = `client_${++clientCounter}`;
   clients.set(clientId, ws);
 
+  // Heartbeat: marks the socket alive on every pong reply. Combined with
+  // the ping interval below, this both keeps the connection alive through
+  // proxies that drop idle sockets (e.g. Railway) and lets us detect and
+  // drop connections that silently died without a proper close handshake.
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
   console.log(`[+] Connected: ${clientId} (total: ${clients.size})`);
 
   ws.send(JSON.stringify({ type: "init", clientId, clientCount: clients.size }));
@@ -51,5 +58,22 @@ wss.on("connection", (ws) => {
 
   ws.on("error", (err) => console.error(`[!] ${clientId}:`, err.message));
 });
+
+// Every 25s, ping all clients. Any client that didn't pong since the last
+// ping is considered dead and gets terminated (which fires its "close"
+// handler above, so it's cleaned up and broadcast as "leave" normally).
+const HEARTBEAT_INTERVAL_MS = 25000;
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      console.log("[!] Terminating unresponsive connection");
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_INTERVAL_MS);
+
+wss.on("close", () => clearInterval(heartbeat));
 
 console.log(`✦ Server running on port ${PORT} — broadcasting to all clients`);
