@@ -6,6 +6,11 @@ const wss = new WebSocket.Server({ port: PORT });
 const clients = new Map();
 let clientCounter = 0;
 
+// Latest interaction-gating state sent by TouchDesigner, re-sent to every
+// newly connecting phone so it reflects the current state immediately
+// instead of waiting for the next change.
+let sessionState = { type: "session", active: true, message: "" };
+
 wss.on("connection", (ws) => {
   const clientId = `client_${++clientCounter}`;
   clients.set(clientId, ws);
@@ -20,6 +25,7 @@ wss.on("connection", (ws) => {
   console.log(`[+] Connected: ${clientId} (total: ${clients.size})`);
 
   ws.send(JSON.stringify({ type: "init", clientId, clientCount: clients.size }));
+  ws.send(JSON.stringify(sessionState));
 
   ws.on("message", (raw) => {
     let msg;
@@ -37,6 +43,23 @@ wss.on("connection", (ws) => {
       });
 
       console.log(`[→] control from ${clientId}: px=${msg.px?.toFixed(2)} py=${msg.py?.toFixed(2)} size=${msg.size?.toFixed(2)} h=${msg.color_h?.toFixed(2)} s=${msg.color_s?.toFixed(2)} v=${msg.color_v?.toFixed(2)}`);
+    }
+
+    if (msg.type === "session") {
+      // Sent by TouchDesigner to gate interaction and show/update the
+      // overlay text on all phones, e.g. between show segments.
+      sessionState = {
+        type: "session",
+        active: !!msg.active,
+        message: typeof msg.message === "string" ? msg.message : "",
+      };
+      console.log(`[TD] session from ${clientId}: active=${sessionState.active} message="${sessionState.message}"`);
+
+      clients.forEach((targetWs, targetId) => {
+        if (targetId !== clientId && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.send(JSON.stringify(sessionState));
+        }
+      });
     }
   });
 
