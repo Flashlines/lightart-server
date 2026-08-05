@@ -92,25 +92,3 @@ const heartbeat = setInterval(() => {
 wss.on("close", () => clearInterval(heartbeat));
 
 console.log(`✦ Server running on port ${PORT} — broadcasting to all clients`);
-
-  ws.on("error", (err) => console.error(`[!] ${clientId}:`, err.message));
-});
-
-// Every 25s, ping all clients. Any client that didn't pong since the last
-// ping is considered dead and gets terminated (which fires its "close"
-// handler above, so it's cleaned up and broadcast as "leave" normally).
-const HEARTBEAT_INTERVAL_MS = 25000;
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) {
-      console.log("[!] Terminating unresponsive connection");
-      return ws.terminate();
-    }
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, HEARTBEAT_INTERVAL_MS);
-
-wss.on("close", () => clearInterval(heartbeat));
-
-console.log(`✦ Server running on port ${PORT} — broadcasting to all clients`);
