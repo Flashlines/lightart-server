@@ -11,20 +11,116 @@ let clientCounter = 0;
 // instead of waiting for the next change.
 let sessionState = { type: "session", active: true, message: "" };
 
+// ─── CAPACITY / QUEUE ──────────────────────────────────────────
+// Infinity = no limit set yet (feature inert until TD calls set_max_users()).
+let maxActiveUsers = Infinity;
+const activeClients = new Map(); // clientId -> activatedAt (ms)
+const queue = []; // clientId[], FIFO
+
+const TURN_DURATION_MS = 30000; // max time in an active slot once someone is waiting
+const ROTATION_TICK_MS = 1000;
+
+function oldestActiveClientId() {
+  let oldest = null;
+  let oldestTime = Infinity;
+  for (const [id, t] of activeClients) {
+    if (t < oldestTime) { oldest = id; oldestTime = t; }
+  }
+  return oldest;
+}
+
+function broadcastLeave(clientId) {
+  const leaveMsg = JSON.stringify({ type: "leave", clientId, timestamp: Date.now() });
+  clients.forEach((targetWs) => {
+    if (targetWs.readyState === WebSocket.OPEN) targetWs.send(leaveMsg);
+  });
+}
+
+function broadcastClientCount() {
+  const countMsg = JSON.stringify({ type: "clientCount", count: clients.size });
+  clients.forEach((targetWs) => {
+    if (targetWs.readyState === WebSocket.OPEN) targetWs.send(countMsg);
+  });
+}
+
+// Tells a single client whether it currently holds an active slot (and how
+// long it has left, if anyone is waiting) or is queued (and at what
+// position).
+function sendTurnState(clientId) {
+  const ws = clients.get(clientId);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (activeClients.has(clientId)) {
+    const activatedAt = activeClients.get(clientId);
+    const remainingMs = queue.length > 0
+      ? Math.max(0, TURN_DURATION_MS - (Date.now() - activatedAt))
+      : null; // no one waiting -> no countdown pressure
+    ws.send(JSON.stringify({ type: "turn", active: true, remainingMs }));
+  } else {
+    const position = queue.indexOf(clientId) + 1; // 1-based
+    ws.send(JSON.stringify({ type: "turn", active: false, position, queueLength: queue.length }));
+  }
+}
+
+// Demotes a client that has been evicted (either its 30s turn ran out, or
+// maxActiveUsers shrank below the current active count): drops it from
+// ws_instances (via a normal "leave") and, if still connected, sends it to
+// the back of the queue.
+function demote(clientId) {
+  if (!activeClients.delete(clientId)) return;
+  broadcastLeave(clientId);
+  const ws = clients.get(clientId);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    queue.push(clientId);
+    sendTurnState(clientId);
+  }
+}
+
+function promote(clientId) {
+  activeClients.set(clientId, Date.now());
+  sendTurnState(clientId);
+}
+
+// Single source of truth: brings activeClients/queue back in line with
+// maxActiveUsers. Call after anything that could free or shrink capacity
+// (connect, disconnect, config change, rotation tick).
+function rebalance() {
+  while (activeClients.size > maxActiveUsers) {
+    demote(oldestActiveClientId());
+  }
+  while (activeClients.size < maxActiveUsers && queue.length > 0) {
+    promote(queue.shift());
+  }
+  if (queue.length === 0) {
+    // Queue just drained (or was already empty) - make sure any client
+    // still showing a countdown from a moment ago gets it cleared.
+    for (const clientId of activeClients.keys()) sendTurnState(clientId);
+  }
+}
+
 wss.on("connection", (ws) => {
   const clientId = `client_${++clientCounter}`;
   clients.set(clientId, ws);
 
   console.log(`[+] Connected: ${clientId} (total: ${clients.size})`);
 
+  if (activeClients.size < maxActiveUsers) {
+    activeClients.set(clientId, Date.now());
+  } else {
+    queue.push(clientId);
+  }
+
   ws.send(JSON.stringify({ type: "init", clientId, clientCount: clients.size }));
   ws.send(JSON.stringify(sessionState));
+  sendTurnState(clientId);
 
   ws.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.type === "control") {
+      if (!activeClients.has(clientId)) return; // queued clients can't push state
+
       msg.clientId = clientId;
       msg.timestamp = Date.now();
 
@@ -54,26 +150,51 @@ wss.on("connection", (ws) => {
         }
       });
     }
+
+    if (msg.type === "config" && msg.maxUsers !== undefined) {
+      // Sent by TouchDesigner via set_max_users(). 0/empty = unlimited.
+      const n = parseInt(msg.maxUsers, 10);
+      maxActiveUsers = Number.isFinite(n) && n > 0 ? n : Infinity;
+      console.log(`[TD] maxUsers -> ${maxActiveUsers === Infinity ? "unbegrenzt" : maxActiveUsers}`);
+      rebalance();
+    }
   });
 
   ws.on("close", () => {
     clients.delete(clientId);
+    const wasActive = activeClients.delete(clientId);
+    const qIdx = queue.indexOf(clientId);
+    if (qIdx !== -1) queue.splice(qIdx, 1);
+
     console.log(`[-] Disconnected: ${clientId} (remaining: ${clients.size})`);
 
     // Tell everyone (including TouchDesigner) which client left, so it can
     // be pruned from any per-instance table/CHOP.
-    const leaveMsg = JSON.stringify({ type: "leave", clientId, timestamp: Date.now() });
-    const countMsg = JSON.stringify({ type: "clientCount", count: clients.size });
-    clients.forEach((targetWs) => {
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(leaveMsg);
-        targetWs.send(countMsg);
-      }
-    });
+    broadcastLeave(clientId);
+    broadcastClientCount();
+
+    if (wasActive) rebalance(); // free slot -> promote next in queue
   });
 
   ws.on("error", (err) => console.error(`[!] ${clientId}:`, err.message));
 });
+
+// Every 1s while someone is waiting: evict active clients whose 30s turn is
+// up (freeing their slot for the queue) and push updated countdowns /
+// queue positions to everyone affected. Entirely inert (no work, no
+// traffic) as long as nobody is queued.
+setInterval(() => {
+  if (queue.length === 0) return;
+
+  const now = Date.now();
+  for (const [clientId, activatedAt] of [...activeClients.entries()]) {
+    if (now - activatedAt >= TURN_DURATION_MS) demote(clientId);
+  }
+  rebalance();
+
+  for (const clientId of activeClients.keys()) sendTurnState(clientId);
+  for (const clientId of queue) sendTurnState(clientId);
+}, ROTATION_TICK_MS);
 
 // Every 25s, send a harmless text keepalive to every client. This is an
 // application-level heartbeat (not the low-level WS ping/pong control
