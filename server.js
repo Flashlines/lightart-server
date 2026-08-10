@@ -15,6 +15,8 @@ let clientCounter = 0;
 // message handling.
 const roles = new Map();
 
+let controlMsgCount = 0; // reset each STATS_INTERVAL_MS by the periodic log below
+
 // Latest interaction-gating state sent by TouchDesigner, re-sent to every
 // newly connecting phone so it reflects the current state immediately
 // instead of waiting for the next change.
@@ -171,7 +173,15 @@ wss.on("connection", (ws) => {
         }
       });
 
-      console.log(`[→] control from ${clientId}: px=${msg.px?.toFixed(2)} py=${msg.py?.toFixed(2)} size=${msg.size?.toFixed(2)} h=${msg.color_h?.toFixed(2)} s=${msg.color_s?.toFixed(2)} v=${msg.color_v?.toFixed(2)}`);
+      // Logging every single control message (previously via console.log
+      // here) is fine at low volume on a local terminal, but at a few
+      // thousand messages/sec it becomes a real bottleneck on a hosted
+      // platform like Railway, where stdout is captured/shipped off-box
+      // rather than written to a fast local TTY - console.log there is
+      // comparatively expensive and can itself become the backpressure
+      // source. Tracked as a counter instead; see the periodic stats log
+      // below.
+      controlMsgCount++;
     }
 
     if (msg.type === "session") {
@@ -219,6 +229,15 @@ wss.on("connection", (ws) => {
 
   ws.on("error", (err) => console.error(`[!] ${clientId}:`, err.message));
 });
+
+// Cheap periodic visibility into control-message volume, without paying
+// per-message console.log cost at high throughput.
+const STATS_INTERVAL_MS = 5000;
+setInterval(() => {
+  if (controlMsgCount === 0) return;
+  console.log(`[stats] control msgs: ${(controlMsgCount / (STATS_INTERVAL_MS / 1000)).toFixed(0)}/s, active=${activeClients.size} queued=${queue.length} connected=${clients.size}`);
+  controlMsgCount = 0;
+}, STATS_INTERVAL_MS);
 
 // Every 1s while someone is waiting: evict active clients whose 30s turn is
 // up (freeing their slot for the queue) and push updated countdowns /
