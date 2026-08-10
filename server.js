@@ -6,14 +6,26 @@ const wss = new WebSocket.Server({ port: PORT });
 const clients = new Map();
 let clientCounter = 0;
 
+// clientId -> "td" | "phone" (default). Set by an explicit {type:"hello",
+// role:"td"} message sent once from ws_callbacks.py's onConnect. Used to
+// avoid broadcasting per-frame control data to every connected phone (only
+// TouchDesigner needs it) - see the 2026-08 incident where an unbounded
+// number of active phones each fanned their control stream out to every
+// other phone, overloading both this process and TD's single-threaded
+// message handling.
+const roles = new Map();
+
 // Latest interaction-gating state sent by TouchDesigner, re-sent to every
 // newly connecting phone so it reflects the current state immediately
 // instead of waiting for the next change.
 let sessionState = { type: "session", active: true, message: "" };
 
 // ─── CAPACITY / QUEUE ──────────────────────────────────────────
-// Infinity = no limit set yet (feature inert until TD calls set_max_users()).
-let maxActiveUsers = Infinity;
+// Default cap so an event that forgets to call set_max_users() fails safe
+// instead of letting every connecting phone become an active slot (root
+// cause of the 2026-08 freeze). Raise via set_max_users(n), or explicitly
+// set_max_users(0) to opt back into unlimited.
+let maxActiveUsers = 50;
 const activeClients = new Map(); // clientId -> activatedAt (ms)
 const queue = []; // clientId[], FIFO
 
@@ -24,15 +36,21 @@ function oldestActiveClientId() {
   let oldest = null;
   let oldestTime = Infinity;
   for (const [id, t] of activeClients) {
+    if (roles.get(id) === "td") continue; // TD is never a rotation candidate
     if (t < oldestTime) { oldest = id; oldestTime = t; }
   }
   return oldest;
 }
 
+// "leave" (like "control") is only consumed by TouchDesigner (to prune
+// ws_instances) - phones have no handler for it, so broadcasting it to
+// every connected phone was pure wasted fan-out.
 function broadcastLeave(clientId) {
   const leaveMsg = JSON.stringify({ type: "leave", clientId, timestamp: Date.now() });
-  clients.forEach((targetWs) => {
-    if (targetWs.readyState === WebSocket.OPEN) targetWs.send(leaveMsg);
+  clients.forEach((targetWs, targetId) => {
+    if (roles.get(targetId) === "td" && targetWs.readyState === WebSocket.OPEN) {
+      targetWs.send(leaveMsg);
+    }
   });
 }
 
@@ -118,15 +136,37 @@ wss.on("connection", (ws) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
+    if (msg.type === "hello") {
+      // Sent once by ws_callbacks.py's onConnect to identify the
+      // TouchDesigner connection, so control/leave fan-out can target it
+      // specifically instead of every connected phone.
+      if (msg.role === "td") {
+        roles.set(clientId, "td");
+        // TD is a consumer, not a controllable slot - keep it out of the
+        // capacity/queue accounting entirely so a full house of phones can
+        // never rotate TD itself into the queue and silently break
+        // interaction gating for everyone.
+        activeClients.delete(clientId);
+        const qIdx = queue.indexOf(clientId);
+        if (qIdx !== -1) queue.splice(qIdx, 1);
+        rebalance();
+        console.log(`[TD] ${clientId} identified as TouchDesigner`);
+      }
+      return;
+    }
+
     if (msg.type === "control") {
       if (!activeClients.has(clientId)) return; // queued clients can't push state
 
       msg.clientId = clientId;
       msg.timestamp = Date.now();
 
-      // Broadcast to ALL other clients (including TouchDesigner)
+      // Only TouchDesigner consumes control data - broadcasting it to
+      // every other phone too (as this used to do) turned each incoming
+      // message into O(clients) outgoing sends, which is what overloaded
+      // the server and TD's message handling once enough phones connected.
       clients.forEach((targetWs, targetId) => {
-        if (targetId !== clientId && targetWs.readyState === WebSocket.OPEN) {
+        if (targetId !== clientId && roles.get(targetId) === "td" && targetWs.readyState === WebSocket.OPEN) {
           targetWs.send(JSON.stringify(msg));
         }
       });
@@ -162,6 +202,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     clients.delete(clientId);
+    roles.delete(clientId);
     const wasActive = activeClients.delete(clientId);
     const qIdx = queue.indexOf(clientId);
     if (qIdx !== -1) queue.splice(qIdx, 1);
@@ -212,4 +253,4 @@ const heartbeat = setInterval(() => {
 
 wss.on("close", () => clearInterval(heartbeat));
 
-console.log(`✦ Server running on port ${PORT} — broadcasting to all clients`);
+console.log(`✦ Server running on port ${PORT} — control/leave routed to TD only`);
